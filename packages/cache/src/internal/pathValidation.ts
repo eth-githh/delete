@@ -27,6 +27,11 @@ export interface PathValidationViolation {
     | 'OUTSIDE_ROOTS'
     | 'LINK_OUTSIDE_ROOTS'
     | 'UNSUPPORTED_TYPE'
+    | 'PAX_DESYNC'
+    | 'PAX_PARSE_FAIL'
+    | 'PAX_UNKNOWN_KEY'
+    | 'UNSAFE_CHAR'
+    | 'GLOB_METACHAR'
   /** Human-readable description of the violation. */
   reason: string
 }

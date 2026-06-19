@@ -5,7 +5,17 @@ import * as zlib from 'zlib'
 import {execSync} from 'child_process'
 import {Header} from 'tar'
 import {CompressionMethod} from '../src/internal/constants'
-import {listAndValidate} from '../src/internal/listAndValidate'
+import {listAndValidate as listAndValidateImpl} from '../src/internal/listAndValidate'
+
+/**
+ * Thin wrapper returning only the violations array, so the many existing
+ * assertions below can keep treating the result as a flat list. New tests that
+ * need the `approvedNames` allow-list call `listAndValidateImpl` directly.
+ */
+const listAndValidate = async (
+  ...args: Parameters<typeof listAndValidateImpl>
+): Promise<Awaited<ReturnType<typeof listAndValidateImpl>>['violations']> =>
+  (await listAndValidateImpl(...args)).violations
 
 /**
  * Real-archive integration tests for listAndValidate. These build small tar

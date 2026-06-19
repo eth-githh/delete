@@ -1,6 +1,7 @@
 import * as exec from '@actions/exec'
 import * as core from '@actions/core'
 import * as io from '@actions/io'
+import * as fs from 'fs'
 import * as path from 'path'
 import {CompressionMethod} from '../src/internal/constants'
 import * as tar from '../src/internal/tar'
@@ -82,23 +83,26 @@ describe('extractTar path validation integration', () => {
     })
 
     test('violations present: exactly one warning, debug per violation, extraction still proceeds', async () => {
-      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue([
-        {
-          path: '../escape.txt',
-          resolved: '',
-          entryType: 'File',
-          code: 'OUTSIDE_ROOTS',
-          reason: 'escapes allowed roots'
-        },
-        {
-          path: 'cache/link',
-          linkpath: '/etc/passwd',
-          resolved: '',
-          entryType: 'SymbolicLink',
-          code: 'LINK_OUTSIDE_ROOTS',
-          reason: 'symlink target outside allowed roots'
-        }
-      ])
+      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue({
+        approvedNames: [],
+        violations: [
+          {
+            path: '../escape.txt',
+            resolved: '',
+            entryType: 'File',
+            code: 'OUTSIDE_ROOTS',
+            reason: 'escapes allowed roots'
+          },
+          {
+            path: 'cache/link',
+            linkpath: '/etc/passwd',
+            resolved: '',
+            entryType: 'SymbolicLink',
+            code: 'LINK_OUTSIDE_ROOTS',
+            reason: 'symlink target outside allowed roots'
+          }
+        ]
+      })
       const warnSpy = jest.spyOn(core, 'warning').mockImplementation()
       const debugSpy = jest.spyOn(core, 'debug').mockImplementation()
       const execMock = jest.spyOn(exec, 'exec').mockResolvedValue(0)
@@ -120,15 +124,18 @@ describe('extractTar path validation integration', () => {
     })
 
     test('single violation: warning text uses singular wording', async () => {
-      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue([
-        {
-          path: '../boom.txt',
-          resolved: '',
-          entryType: 'File',
-          code: 'OUTSIDE_ROOTS',
-          reason: 'escapes'
-        }
-      ])
+      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue({
+        approvedNames: [],
+        violations: [
+          {
+            path: '../boom.txt',
+            resolved: '',
+            entryType: 'File',
+            code: 'OUTSIDE_ROOTS',
+            reason: 'escapes'
+          }
+        ]
+      })
       const warnSpy = jest.spyOn(core, 'warning').mockImplementation()
       jest.spyOn(core, 'debug').mockImplementation()
       jest.spyOn(exec, 'exec').mockResolvedValue(0)
@@ -144,15 +151,18 @@ describe('extractTar path validation integration', () => {
 
   describe("mode 'error'", () => {
     test('violations present: throws CacheIntegrityError, system tar NEVER invoked', async () => {
-      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue([
-        {
-          path: '../etc/passwd',
-          resolved: '',
-          entryType: 'File',
-          code: 'OUTSIDE_ROOTS',
-          reason: 'escapes allowed roots'
-        }
-      ])
+      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue({
+        approvedNames: [],
+        violations: [
+          {
+            path: '../etc/passwd',
+            resolved: '',
+            entryType: 'File',
+            code: 'OUTSIDE_ROOTS',
+            reason: 'escapes allowed roots'
+          }
+        ]
+      })
       jest.spyOn(core, 'warning').mockImplementation()
       jest.spyOn(core, 'debug').mockImplementation()
       const execMock = jest.spyOn(exec, 'exec').mockResolvedValue(0)
@@ -183,7 +193,7 @@ describe('extractTar path validation integration', () => {
       ]
       jest
         .spyOn(listAndValidate, 'listAndValidate')
-        .mockResolvedValue(violations)
+        .mockResolvedValue({violations, approvedNames: []})
       jest.spyOn(core, 'warning').mockImplementation()
       jest.spyOn(core, 'debug').mockImplementation()
 
@@ -338,6 +348,72 @@ describe('extractTar path validation integration', () => {
       })
 
       expect(listMock.mock.calls[0][1]).toBe(CompressionMethod.ZstdWithoutLong)
+    })
+  })
+
+  describe("mode 'error' extraction allow-list", () => {
+    test('clean archive: extraction restricted to approved members via --null/-T', async () => {
+      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue({
+        violations: [],
+        approvedNames: ['cache/a.txt', 'cache/b.txt']
+      })
+      jest.spyOn(io, 'mkdirP').mockResolvedValue()
+
+      let command = ''
+      let listPath: string | undefined
+      let listContents: Buffer | undefined
+      jest.spyOn(exec, 'exec').mockImplementation(async cmd => {
+        command = cmd
+        const m = /-T "([^"]+)"/.exec(command)
+        if (m) {
+          listPath = m[1]
+          listContents = fs.readFileSync(listPath)
+        }
+        return 0
+      })
+
+      await tar.extractTar(archive, CompressionMethod.Gzip, {
+        declaredPaths: ['cache/**'],
+        pathValidation: 'error'
+      })
+
+      // Allow-list flags are present and `--null` precedes `-T`.
+      expect(command).toContain('--null')
+      expect(command).toContain('--no-recursion')
+      expect(command).toMatch(/--null .*-T "[^"]+"/)
+      // GNU tar (the tool detected under the io.which mock on non-Windows)
+      // additionally receives the wildcard-hardening flags.
+      if (process.platform !== 'win32') {
+        expect(command).toContain('--no-wildcards')
+        expect(command).toContain('--anchored')
+      }
+      // The list is NUL-separated and contains exactly the approved names.
+      expect(listContents?.toString('utf8')).toBe('cache/a.txt\0cache/b.txt\0')
+      // The temporary allow-list file is cleaned up after extraction.
+      expect(listPath).toBeDefined()
+      expect(fs.existsSync(listPath as string)).toBe(false)
+    })
+
+    test('warn mode does not restrict extraction (no -T) even when clean', async () => {
+      jest.spyOn(listAndValidate, 'listAndValidate').mockResolvedValue({
+        violations: [],
+        approvedNames: ['cache/a.txt']
+      })
+      jest.spyOn(io, 'mkdirP').mockResolvedValue()
+
+      let command = ''
+      jest.spyOn(exec, 'exec').mockImplementation(async cmd => {
+        command = cmd
+        return 0
+      })
+
+      await tar.extractTar(archive, CompressionMethod.Gzip, {
+        declaredPaths: ['cache/**'],
+        pathValidation: 'warn'
+      })
+
+      expect(command).not.toContain('-T "')
+      expect(command).not.toContain('--no-recursion')
     })
   })
 })

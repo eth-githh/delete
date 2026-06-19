@@ -1,7 +1,9 @@
 import {exec} from '@actions/exec'
 import * as core from '@actions/core'
 import * as io from '@actions/io'
-import {existsSync, writeFileSync} from 'fs'
+import {existsSync, writeFileSync, unlinkSync} from 'fs'
+import * as os from 'os'
+import * as crypto from 'crypto'
 import * as path from 'path'
 import * as utils from './cacheUtils.js'
 import {ArchiveTool} from './contracts.js'
@@ -64,7 +66,8 @@ async function getTarArgs(
   tarPath: ArchiveTool,
   compressionMethod: CompressionMethod,
   type: string,
-  archivePath = ''
+  archivePath = '',
+  allowListPath = ''
 ): Promise<string[]> {
   const args = [`"${tarPath.path}"`]
   const cacheFileName = utils.getCacheFileName(compressionMethod)
@@ -106,6 +109,34 @@ async function getTarArgs(
         '-C',
         workingDirectory.replace(new RegExp(`\\${path.sep}`, 'g'), '/')
       )
+      // When an extraction allow-list is supplied (pathValidation: 'error'
+      // with a clean archive), restrict extraction to exactly the members the
+      // validator approved, matched by the names node-tar derived from the
+      // same bytes. This makes the extraction parser's view of any
+      // path-channel parser differential a no-op: a member system tar would
+      // place at a different path than node-tar simply isn't on the list.
+      //
+      // `--null` MUST precede `-T` on GNU tar (otherwise the list is read
+      // newline-delimited with stray NULs). `--no-recursion` stops an
+      // approved directory from implicitly pulling in unapproved children.
+      // The `--no-wildcards*` / `--anchored` flags are GNU-only defence in
+      // depth; bsdtar lacks them but glob metacharacters are already rejected
+      // during validation, so its `fnmatch()`-based `-T` matching degrades to
+      // exact-name matching.
+      if (allowListPath) {
+        args.push('--null', '--no-recursion')
+        if (tarPath.type === ArchiveToolType.GNU) {
+          args.push(
+            '--no-wildcards',
+            '--no-wildcards-match-slash',
+            '--anchored'
+          )
+        }
+        args.push(
+          '-T',
+          `"${allowListPath.replace(new RegExp(`\\${path.sep}`, 'g'), '/')}"`
+        )
+      }
       break
     case 'list':
       args.push(
@@ -137,7 +168,8 @@ async function getTarArgs(
 async function getCommands(
   compressionMethod: CompressionMethod,
   type: string,
-  archivePath = ''
+  archivePath = '',
+  allowListPath = ''
 ): Promise<string[]> {
   let args
 
@@ -146,7 +178,8 @@ async function getCommands(
     tarPath,
     compressionMethod,
     type,
-    archivePath
+    archivePath,
+    allowListPath
   )
   const compressionArgs =
     type !== 'create'
@@ -290,6 +323,11 @@ export async function extractTar(
   const workingDirectory = getWorkingDirectory()
   const pathValidation: PathValidationMode = options?.pathValidation ?? 'off'
 
+  // Names approved for extraction by the validator. When pathValidation is
+  // 'error' and the archive is clean, system tar is restricted to exactly
+  // these members via a NUL-separated `-T` allow-list (see below).
+  let approvedNames: string[] | undefined
+
   // Run path validation BEFORE creating the extraction directory or invoking
   // system tar. In 'error' mode, a CacheIntegrityError thrown here means no
   // bytes are ever written to the workspace. In 'warn' mode, violations are
@@ -306,12 +344,14 @@ export async function extractTar(
     }
     let violations: PathValidationViolation[] | undefined
     try {
-      violations = await listAndValidate(
+      const result = await listAndValidate(
         archivePath,
         compressionMethod,
         allowedRoots,
         workingDirectory
       )
+      violations = result.violations
+      approvedNames = result.approvedNames
     } catch (error) {
       // Parse / decompression failure encountered while validating. The
       // validator's tar parser is stricter than the system `tar` that
@@ -344,13 +384,61 @@ export async function extractTar(
           violations
         )
       }
+      // In 'warn' mode a violation means we must NOT restrict extraction to
+      // the (possibly incomplete) approved list — fall back to extracting
+      // everything, matching legacy behavior.
+      approvedNames = undefined
     }
   }
 
   // Create directory to extract tar into
   await io.mkdirP(workingDirectory)
-  const commands = await getCommands(compressionMethod, 'extract', archivePath)
-  await execCommands(commands)
+
+  // In 'error' mode with a clean archive, write the approved member names to a
+  // NUL-separated allow-list and restrict system tar to exactly those members.
+  // This closes path-channel parser differentials: a member tar would extract
+  // to an escaped path is not on the list, so it is never extracted.
+  let allowListPath = ''
+  if (pathValidation === 'error' && approvedNames !== undefined) {
+    allowListPath = writeAllowList(approvedNames)
+  }
+
+  try {
+    const commands = await getCommands(
+      compressionMethod,
+      'extract',
+      archivePath,
+      allowListPath
+    )
+    await execCommands(commands)
+  } finally {
+    if (allowListPath) {
+      try {
+        unlinkSync(allowListPath)
+      } catch {
+        // best-effort cleanup of the temporary allow-list file
+      }
+    }
+  }
+}
+
+/**
+ * Write the approved member names to a temporary NUL-separated file suitable
+ * for `tar --null -T`. Returns the absolute path to the written file. The
+ * caller is responsible for unlinking it.
+ */
+function writeAllowList(approvedNames: string[]): string {
+  const allowListPath = path.join(
+    os.tmpdir(),
+    `cache-allow-${process.pid}-${Date.now()}-${crypto
+      .randomBytes(4)
+      .toString('hex')}.lst`
+  )
+  const payload = Buffer.concat(
+    approvedNames.flatMap(name => [Buffer.from(name, 'utf8'), Buffer.from([0])])
+  )
+  writeFileSync(allowListPath, payload, {mode: 0o600})
+  return allowListPath
 }
 
 function reportViolations(
