@@ -1,7 +1,7 @@
 # Path Validation Test Plan — `@actions/cache`
 
 This document describes the test coverage for the client-side cache-archive path
-validation feature introduced in `@actions/cache` v6.1.0.
+validation feature introduced in `@actions/cache` v6.2.0.
 
 ## Feature summary
 
@@ -17,9 +17,22 @@ extractTar(archivePath, compressionMethod, {
 When `pathValidation !== 'off'`, the archive is streamed through `node-tar`'s
 `Parser` (no extraction) and every entry's path / linkpath is checked against
 the set of allowed roots derived from `declaredPaths` (or, if that list is
-empty, the GitHub Actions workspace as a single fail-safe root). Violations are
-collected; in `'error'` mode a `CacheIntegrityError` is thrown **before** system
-tar is invoked, so no bytes are ever written to the workspace.
+empty, the GitHub Actions workspace as a single fail-safe root). Beyond simple
+containment, the validator also defends against parser differentials between
+`node-tar` (used for listing) and system `tar` (used for extraction):
+length-correct PAX extended-header re-parsing, unknown-PAX-key rejection, and
+unsafe-character / glob-metacharacter rejection. `listAndValidate` returns both
+the collected `violations` and the `approvedNames` (the exact member names
+`node-tar` derived from the archive bytes).
+
+Violations are collected; in `'error'` mode a `CacheIntegrityError` is thrown
+**before** system tar is invoked, so no bytes are ever written to the workspace.
+In `'error'` mode on a **clean** archive, extraction is additionally restricted
+to exactly the `approvedNames` via a NUL-separated `tar --null --no-recursion
+-T` allow-list, so a member that system `tar` would place at a different path
+than `node-tar` computed is never extracted. `'warn'` mode never uses the
+allow-list — on any violation it falls back to extracting everything (legacy
+behavior).
 
 `restoreCacheV1` and `restoreCacheV2` forward the caller-supplied
 `pathValidation` mode and the declared `paths` array to `extractTar`. They also
@@ -31,8 +44,9 @@ integrity failures from ordinary cache-miss/network errors.
 | Source | Tests |
 |---|---|
 | [`src/internal/pathValidation.ts`](../src/internal/pathValidation.ts) | [`__tests__/pathValidation.test.ts`](../__tests__/pathValidation.test.ts) |
-| [`src/internal/listAndValidate.ts`](../src/internal/listAndValidate.ts) | [`__tests__/listAndValidate.test.ts`](../__tests__/listAndValidate.test.ts) |
-| [`src/internal/tar.ts`](../src/internal/tar.ts) (integration into `extractTar`) | [`__tests__/tarPathValidation.test.ts`](../__tests__/tarPathValidation.test.ts) |
+| [`src/internal/pax-reparse.ts`](../src/internal/pax-reparse.ts) | [`__tests__/pax-reparse.test.ts`](../__tests__/pax-reparse.test.ts) |
+| [`src/internal/listAndValidate.ts`](../src/internal/listAndValidate.ts) | [`__tests__/listAndValidate.test.ts`](../__tests__/listAndValidate.test.ts), [`__tests__/tarPathValidationAttacks.test.ts`](../__tests__/tarPathValidationAttacks.test.ts) |
+| [`src/internal/tar.ts`](../src/internal/tar.ts) (integration into `extractTar`) | [`__tests__/tarPathValidation.test.ts`](../__tests__/tarPathValidation.test.ts), [`__tests__/tarPathValidationAttacks.test.ts`](../__tests__/tarPathValidationAttacks.test.ts) |
 | [`src/internal/cacheIntegrityError.ts`](../src/internal/cacheIntegrityError.ts) | covered indirectly via the integration tests |
 | [`src/options.ts`](../src/options.ts) (new `pathValidation` field) | [`__tests__/options.test.ts`](../__tests__/options.test.ts) |
 | [`src/cache.ts`](../src/cache.ts) (forwarding + error re-throw) | [`__tests__/restoreCache.test.ts`](../__tests__/restoreCache.test.ts), [`__tests__/restoreCacheV2.test.ts`](../__tests__/restoreCacheV2.test.ts) |
@@ -110,6 +124,74 @@ and platform-specific behavior:
 - Shows up to N items verbatim
 - Truncates the tail with a `(... and N more)` summary line
 
+## Unit tests — PAX re-parser (`pax-reparse.test.ts`)
+
+These exercise the length-correct PAX extended-header re-parser in isolation
+(pure logic, no archives). `node-tar` parses PAX bodies with a naive
+`split('\n')`, which desynchronises from GNU tar / libarchive on values that
+contain embedded newlines. This module re-parses each body byte-accurately and
+cross-checks the result against `node-tar`'s view of the entry.
+
+### `parsePaxLengthCorrect`
+
+- Single well-formed `"<len> <key>=<value>\n"` record
+- **Newline-in-value**: an embedded fake `path=` record is swallowed by the
+  enclosing record's length, rather than parsed as its own record (the core
+  parser-differential)
+- Empty buffer → empty record set
+- `ok: false` for: truncated record, non-numeric length prefix, missing
+  trailing newline, length that spans past the buffer end, record without `=`,
+  record with correct length + LF but no `=`, zero-length prefix
+- Value may itself contain `=` — only the first one is the separator
+- High-bit value bytes preserved as a raw `Buffer`
+- Last write wins for repeated keys
+
+### `crossCheckMetaBodies`
+
+- Clean PAX `path` matching `node-tar` → no violations
+- **F2 path desync** → `PAX_DESYNC` (node-tar resolved a safe name, the
+  length-correct parse disagrees)
+- **F2-linkpath desync** → `PAX_DESYNC`
+- Unknown PAX key → `PAX_UNKNOWN_KEY`
+- Known `SCHILY.` / `GNU.` / `LIBARCHIVE.` prefixed keys accepted
+- GNU long-name raw body matching the entry path (or the link target) → no
+  violation; a body matching neither → flagged
+- No meta bodies → no violations
+- PAX setting both `path` and `linkpath` in agreement → no violations
+- Directory path with trailing slash compares equal (no false desync)
+- Multiple PAX bodies merge with last-write-wins before comparison
+- `PAX_KNOWN_KEYS` includes `path` and `linkpath`
+
+## Integration tests — parser-differential attacks (`tarPathValidationAttacks.test.ts`)
+
+These build the F1 / F2 / F2-linkpath / F3 / F5 proof-of-concept archives from
+the security analysis (see `docs/zip-slip-*`) as **raw tar bytes**, so they can
+craft malicious PAX bodies and typeflags that `node-tar`'s `Header` encoder
+would never emit. They assert the validator refuses each one, and they include
+real-`tar` end-to-end extraction assertions (using a scratch dir via
+`mkdtempSync`).
+
+### Bypass detection (via `listAndValidate`)
+
+- **F1**: unknown typeflag → `UNSUPPORTED_TYPE`
+- **F2**: PAX `path` newline differential → `PAX_DESYNC`
+- **F2-linkpath**: PAX `linkpath` newline differential → `PAX_DESYNC`
+- **F3**: oversized PAX header → `UNSUPPORTED_TYPE`
+- **F5**: sparse typeflag → `UNSUPPORTED_TYPE`
+- Glob metacharacter in entry path → `GLOB_METACHAR`
+- Newline in entry path → `UNSAFE_CHAR`
+- NUL byte in a symlink target (delivered via PAX) → `UNSAFE_CHAR`
+- Unknown PAX key → `PAX_UNKNOWN_KEY`
+- Flood of extended headers → rejected by the pending-meta cap
+- Clean archive → `approvedNames` lists every concrete entry, no violations
+- Legitimate long path via PAX → no violations, approved by its PAX path
+
+### End-to-end extraction (real `tar`)
+
+- `'error'` mode, clean archive → every approved member is extracted
+- `'error'` mode, F2 archive → throws `CacheIntegrityError` and writes nothing
+  to the workspace
+
 ## Integration tests — real archives (`listAndValidate.test.ts`)
 
 These build small tar archives in memory using `tar.Header`, write them to disk,
@@ -139,8 +221,9 @@ Skipped on hosts without `zstd` installed.
 ## Integration tests — mocked downstream (`tarPathValidation.test.ts`)
 
 These mock `listAndValidate` so the test can deterministically inject "violation
-lists" and observe `extractTar`'s reaction. They mock `@actions/exec`,
-`@actions/io` and `@actions/core` to assert what does (and does not) get called.
+lists" and observe `extractTar`'s reaction. The mock returns the production
+shape `{violations, approvedNames}`. They mock `@actions/exec`, `@actions/io`
+and `@actions/core` to assert what does (and does not) get called.
 
 ### `pathValidation: 'off'` (default)
 
@@ -164,6 +247,15 @@ lists" and observe `extractTar`'s reaction. They mock `@actions/exec`,
   system tar not invoked
 - Parse failure in `'warn'` mode → warning is logged, validation is skipped,
   and extraction still proceeds
+
+### `pathValidation: 'error'` extraction allow-list
+
+- Clean archive → extraction is restricted to the approved members: the command
+  contains `--null` immediately before `-T "<file>"`, the `-T` file holds the
+  NUL-separated `approvedNames`, and the temporary allow-list file is cleaned up
+  after extraction
+- `'warn'` mode does **not** restrict extraction (no `-T`) even on a clean
+  archive
 
 ### Plumbing
 
@@ -201,6 +293,8 @@ npx jest --testTimeout 70000 packages/cache
 # just the new path-validation suites
 npx jest --testTimeout 70000 \
   packages/cache/__tests__/pathValidation.test.ts \
+  packages/cache/__tests__/pax-reparse.test.ts \
   packages/cache/__tests__/listAndValidate.test.ts \
-  packages/cache/__tests__/tarPathValidation.test.ts
+  packages/cache/__tests__/tarPathValidation.test.ts \
+  packages/cache/__tests__/tarPathValidationAttacks.test.ts
 ```
