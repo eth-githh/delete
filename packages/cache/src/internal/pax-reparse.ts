@@ -13,8 +13,7 @@
  * legally contain `\n`. GNU tar and libarchive (bsdtar / Windows `tar.exe`)
  * both parse by consuming exactly `<decimal-length>` bytes, so a value
  * containing an embedded `"\n<len> path=<other>\n"` desynchronises node-tar
- * from every real extractor — the F2 / F2-linkpath parser-differential
- * bypasses.
+ * from every real extractor — a path / linkpath parser-differential bypass.
  *
  * This module re-parses each captured PAX body the way every real extractor
  * does (length-prefixed, byte-accurate) and cross-checks the result against
@@ -29,7 +28,11 @@
  */
 
 /** Machine-readable reason codes produced by the PAX cross-check. */
-export type PaxReparseCode = 'PAX_DESYNC' | 'PAX_PARSE_FAIL' | 'PAX_UNKNOWN_KEY'
+export type PaxReparseCode =
+  | 'PAX_DESYNC'
+  | 'PAX_PARSE_FAIL'
+  | 'PAX_UNKNOWN_KEY'
+  | 'PAX_UNSUPPORTED_KEY'
 
 /** A single disagreement surfaced by {@link crossCheckMetaBodies}. */
 export interface PaxReparseViolation {
@@ -85,6 +88,24 @@ export const PAX_KNOWN_PREFIXES: readonly string[] = [
 function isKnownPaxKey(key: string): boolean {
   if (PAX_KNOWN_KEYS.has(key)) return true
   return PAX_KNOWN_PREFIXES.some(prefix => key.startsWith(prefix))
+}
+
+/**
+ * PAX key prefixes that system tar (GNU tar / libarchive) acts on to place or
+ * reconstruct file content but that node-tar v7 does NOT process. node-tar
+ * surfaces such an entry under its header `path`, while system tar would write
+ * it elsewhere — GNU sparse files are reconstructed at `GNU.sparse.name`, which
+ * an attacker can point outside the cache roots. That is a listing-vs-extraction
+ * parser differential the `path` / `linkpath` cross-check cannot see (the key is
+ * neither `path` nor `linkpath`). A cache archive never legitimately contains
+ * sparse members, so any key in this namespace is rejected outright. This is
+ * checked before {@link isKnownPaxKey} so it takes precedence over the broad
+ * `GNU.` allow-list prefix.
+ */
+const PAX_REJECTED_PREFIXES: readonly string[] = ['GNU.sparse.']
+
+function isRejectedPaxKey(key: string): boolean {
+  return PAX_REJECTED_PREFIXES.some(prefix => key.startsWith(prefix))
 }
 
 /** Result of a length-correct parse of a single PAX extended-header body. */
@@ -200,7 +221,12 @@ export function crossCheckMetaBodies(
       // A well-formed PAX extended header.
       sawPax = true
       for (const key of keys) {
-        if (!isKnownPaxKey(key)) {
+        if (isRejectedPaxKey(key)) {
+          violations.push({
+            code: 'PAX_UNSUPPORTED_KEY',
+            reason: `unsupported placement-affecting PAX key '${key}' in extended header (node-tar ignores it; system tar would act on it)`
+          })
+        } else if (!isKnownPaxKey(key)) {
           violations.push({
             code: 'PAX_UNKNOWN_KEY',
             reason: `unknown PAX key '${key}' in extended header`

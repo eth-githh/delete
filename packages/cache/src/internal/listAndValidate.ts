@@ -29,11 +29,15 @@ export interface ListAndValidateResult {
 
 /**
  * Upper bound on the size of a PAX / GNU extended-header body the validator is
- * willing to re-parse. node-tar's default is 1 MiB; real extended headers are
- * a few hundred bytes at most. Anything larger is emitted as an
+ * willing to re-parse, passed to node-tar as `maxMetaEntrySize`. Real extended
+ * headers are a few hundred bytes at most; anything larger is emitted as an
  * `ignoredEntry` (see the handler below) and recorded as a violation rather
- * than silently dropped — this is the F3 (oversized-PAX) defence, made
- * explicit instead of relying on node-tar's internal default.
+ * than silently dropped — the oversized-extended-header defence.
+ *
+ * This deliberately matches node-tar's current 1 MiB default. Pinning it here
+ * (rather than leaving the option unset) keeps the oversized-header threshold
+ * under our control even if a future node-tar release changes its internal
+ * default.
  */
 const META_REJECT_BYTES = 1024 * 1024
 
@@ -87,13 +91,34 @@ export async function listAndValidate(
   // body string of each PAX / GNU long-name header *before* it emits the
   // concrete entry the header applies to. We re-parse these length-correctly
   // (see pax-reparse.ts) and cross-check against node-tar's resolved
-  // path/linkpath to catch the F2 / F2-linkpath PAX newline differential.
+  // path / linkpath to catch PAX newline differentials, where an embedded
+  // newline in a PAX value makes node-tar resolve a different path than the
+  // system tar that performs the extraction.
   let pendingMeta: Buffer[] = []
 
   const consumePendingMeta = (): Buffer[] => {
     const bodies = pendingMeta
     pendingMeta = []
     return bodies
+  }
+
+  // Record a single validation failure. Every call site shares the same shape
+  // — path / linkpath / type come from the ReadEntry; only the code, reason and
+  // resolved location vary — so funnel them through one helper.
+  const addViolation = (
+    entry: ReadEntry,
+    code: PathValidationViolation['code'],
+    reason: string,
+    resolved: string
+  ): void => {
+    violations.push({
+      path: entry.path,
+      linkpath: entry.linkpath || undefined,
+      resolved,
+      entryType: entry.type,
+      code,
+      reason
+    })
   }
 
   // For gzip we let node-tar handle decompression internally (its built-in
@@ -109,8 +134,8 @@ export async function listAndValidate(
     // via the captured error below.
     strict: false,
     // Cap extended-header bodies explicitly so an oversized PAX header is
-    // turned into a recorded `ignoredEntry` violation rather than relying on
-    // node-tar's internal default (F3 defence).
+    // turned into a recorded `ignoredEntry` violation and the oversized-header
+    // threshold stays under our control (see META_REJECT_BYTES).
     maxMetaEntrySize: META_REJECT_BYTES,
     // Treat structural problems (bad archive, bad header, bad chksum) as
     // hard parse errors — silently ignoring them would let a corrupt
@@ -129,6 +154,7 @@ export async function listAndValidate(
     onReadEntry: (entry: ReadEntry) => {
       try {
         const metaBodies = consumePendingMeta()
+        let approved = true
 
         // Cross-check any PAX / long-name headers that preceded this entry
         // against node-tar's resolved view. A disagreement means node-tar
@@ -138,22 +164,16 @@ export async function listAndValidate(
           entry.path,
           entry.linkpath || undefined
         )) {
-          violations.push({
-            path: entry.path,
-            linkpath: entry.linkpath || undefined,
-            resolved: entry.path,
-            entryType: entry.type,
-            code: pax.code,
-            reason: pax.reason
-          })
+          addViolation(entry, pax.code, pax.reason, entry.path)
+          approved = false
         }
 
-        // Reject characters that would corrupt the extraction allow-list or
-        // be reinterpreted by system tar's `-T` matching (glob metacharacters
-        // on bsdtar's fnmatch path). These have no legitimate use in a cache
-        // entry path.
-        const charViolation = checkUnsafeChars(entry.path, entry.linkpath)
-
+        // validateEntry performs every per-string syntactic check (NUL and
+        // other control characters, glob metacharacters, UNC / absolute /
+        // drive-relative forms) on BOTH the entry path and any link target,
+        // plus the allowed-root containment check. Keeping all of those checks
+        // in one place (pathValidation) is what makes entry paths and link
+        // targets treated consistently.
         const result = validateEntry(
           entry.path,
           entry.linkpath || undefined,
@@ -162,32 +182,16 @@ export async function listAndValidate(
           extractCwd
         )
         if (!result.ok) {
-          violations.push({
-            path: entry.path,
-            linkpath: entry.linkpath || undefined,
-            resolved: result.resolved,
-            entryType: entry.type,
-            code: result.code,
-            reason: result.reason
-          })
+          addViolation(entry, result.code, result.reason, result.resolved)
+          approved = false
         }
 
-        if (charViolation) {
-          violations.push({
-            path: entry.path,
-            linkpath: entry.linkpath || undefined,
-            resolved: entry.path,
-            entryType: entry.type,
-            code: charViolation.code,
-            reason: charViolation.reason
-          })
-        }
-
-        // Only entries that passed every check are eligible for the
-        // extraction allow-list. (When any violation exists the allow-list is
-        // unused — extraction is either blocked in 'error' mode or runs
-        // unrestricted in 'warn' mode — so this is belt-and-braces.)
-        if (result.ok && !charViolation) {
+        // Only entries that passed every check (PAX cross-check and path
+        // validation) are eligible for the extraction allow-list. When any
+        // violation exists the allow-list is unused anyway — extraction is
+        // either blocked in 'error' mode or runs unrestricted in 'warn' mode —
+        // but tracking approval per entry keeps the contract simple.
+        if (approved) {
           approvedNames.push(entry.path)
         }
       } finally {
@@ -207,14 +211,12 @@ export async function listAndValidate(
     // The meta header(s) that preceded an ignored entry belong to it; discard
     // them so they aren't mis-associated with a later concrete entry.
     consumePendingMeta()
-    violations.push({
-      path: entry.path,
-      linkpath: entry.linkpath || undefined,
-      resolved: entry.path,
-      entryType: entry.type,
-      code: 'UNSUPPORTED_TYPE',
-      reason: `parser ignored entry of type ${entry.type}`
-    })
+    addViolation(
+      entry,
+      'UNSUPPORTED_TYPE',
+      `parser ignored entry of type ${entry.type}`,
+      entry.path
+    )
   })
 
   // Capture the raw body of each extended-header (meta) entry. node-tar
@@ -237,50 +239,6 @@ export async function listAndValidate(
     throw firstParseError
   }
   return {violations, approvedNames}
-}
-
-/**
- * Reject characters in an entry path (or link target) that have no legitimate
- * place in a cache archive and that would either corrupt the extraction
- * allow-list or be reinterpreted by system tar's `-T` member matching:
- *
- * - NUL / newline in the entry path — would split or terminate a list entry.
- * - glob metacharacters (`* ? [ ]`) in the entry path — bsdtar matches `-T`
- *   names with `fnmatch()`, so an unescaped metacharacter could match (and
- *   extract) members other than the one approved. GNU tar's `--no-wildcards`
- *   also covers this, but rejecting unconditionally keeps the behaviour
- *   identical across tar implementations.
- * - NUL in a link target — same list-corruption concern.
- */
-function checkUnsafeChars(
-  entryPath: string,
-  linkPath: string | undefined
-): {code: 'UNSAFE_CHAR' | 'GLOB_METACHAR'; reason: string} | undefined {
-  if (entryPath.includes('\0') || entryPath.includes('\n')) {
-    return {
-      code: 'UNSAFE_CHAR',
-      reason: `entry path contains an unsafe control character: ${JSON.stringify(
-        entryPath
-      )}`
-    }
-  }
-  if (/[*?[\]]/.test(entryPath)) {
-    return {
-      code: 'GLOB_METACHAR',
-      reason: `entry path contains a glob metacharacter: ${JSON.stringify(
-        entryPath
-      )}`
-    }
-  }
-  if (linkPath !== undefined && linkPath.includes('\0')) {
-    return {
-      code: 'UNSAFE_CHAR',
-      reason: `link target contains an unsafe control character: ${JSON.stringify(
-        linkPath
-      )}`
-    }
-  }
-  return undefined
 }
 
 async function streamArchiveTo(

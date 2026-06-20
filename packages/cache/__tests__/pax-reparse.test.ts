@@ -23,17 +23,17 @@ describe('parsePaxLengthCorrect', () => {
   })
 
   test('newline-in-value: the embedded fake record is swallowed by comment', () => {
-    // This is the F2 PAX body. A naive split('\n') parser (node-tar) ends up
-    // with path=safe.txt; the length-correct parser must yield the real
+    // An embedded-newline PAX body. A naive split('\n') parser (node-tar) ends
+    // up with path=safe.txt; the length-correct parser must yield the real
     // (malicious) path and treat the rest as the comment value.
     const buf = Buffer.from(
-      '42 path=../../../../../../tmp/zip_slip_F2\n30 comment=x\n17 path=safe.txt\n',
+      '42 path=../../../../../../tmp/escaped_pax\n30 comment=x\n17 path=safe.txt\n',
       'ascii'
     )
     const {records, ok} = parsePaxLengthCorrect(buf)
     expect(ok).toBe(true)
     expect(records['path'].toString('utf8')).toBe(
-      '../../../../../../tmp/zip_slip_F2'
+      '../../../../../../tmp/escaped_pax'
     )
     expect(records['comment'].toString('utf8')).toBe('x\n17 path=safe.txt')
     // Crucially NOT safe.txt.
@@ -133,16 +133,16 @@ describe('crossCheckMetaBodies', () => {
     expect(v).toEqual([])
   })
 
-  test('F2 path desync: node-tar resolved safe.txt, length-correct disagrees', () => {
+  test('PAX path desync: node-tar resolved safe.txt, length-correct disagrees', () => {
     const buf = Buffer.from(
-      '42 path=../../../../../../tmp/zip_slip_F2\n30 comment=x\n17 path=safe.txt\n',
+      '42 path=../../../../../../tmp/escaped_pax\n30 comment=x\n17 path=safe.txt\n',
       'ascii'
     )
     const v = crossCheckMetaBodies([buf], 'safe.txt', undefined)
     expect(v.map(x => x.code)).toContain('PAX_DESYNC')
   })
 
-  test('F2-linkpath desync: node-tar resolved safe/target, length-correct disagrees', () => {
+  test('PAX linkpath desync: node-tar resolved safe/target, length-correct disagrees', () => {
     const buf = Buffer.from(
       '34 linkpath=../../../../../../tmp\n37 comment=x\n24 linkpath=safe/target\n',
       'ascii'
@@ -162,10 +162,9 @@ describe('crossCheckMetaBodies', () => {
     expect(v.map(x => x.code)).toContain('PAX_UNKNOWN_KEY')
   })
 
-  test('known SCHILY/GNU/LIBARCHIVE prefixed keys are accepted', () => {
+  test('known SCHILY/LIBARCHIVE prefixed keys are accepted', () => {
     const records = [
       'SCHILY.xattr.user.foo=bar',
-      'GNU.sparse.realsize=1024',
       'LIBARCHIVE.creationtime=1700000000'
     ]
     const body = records
@@ -183,6 +182,30 @@ describe('crossCheckMetaBodies', () => {
       undefined
     )
     expect(v).toEqual([])
+  })
+
+  test('GNU.sparse.* keys are rejected as PAX_UNSUPPORTED_KEY', () => {
+    // node-tar v7 does not process GNU sparse keys, so it surfaces the entry
+    // under its header path while system tar would reconstruct the file at
+    // `GNU.sparse.name` (here pointing outside the cache roots). The path /
+    // linkpath cross-check cannot see this, so the sparse namespace must be
+    // rejected outright even though it is under the broadly-allowed `GNU.`
+    // prefix.
+    const body = Buffer.from(
+      rec('GNU.sparse.major=1') +
+        rec('GNU.sparse.minor=0') +
+        rec('GNU.sparse.name=../../../../tmp/evil') +
+        rec('GNU.sparse.realsize=1024'),
+      'ascii'
+    )
+    const v = crossCheckMetaBodies(
+      [body],
+      'cache/GNUSparseFile.0/decoy',
+      undefined
+    )
+    expect(v.map(x => x.code)).toContain('PAX_UNSUPPORTED_KEY')
+    // It must NOT also be misreported as merely an unknown key.
+    expect(v.map(x => x.code)).not.toContain('PAX_UNKNOWN_KEY')
   })
 
   test('GNU long-name raw body matching entry path: no violation', () => {

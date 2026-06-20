@@ -979,10 +979,11 @@ describe('validateEntry', () => {
     })
   })
 
-  describe('control characters in filenames (legal but unusual)', () => {
-    test('embedded newline is treated literally as part of the segment', () => {
-      // node-tar reports the full filename including the embedded newline.
-      // It's a single segment under node_modules — must be accepted.
+  describe('control characters in filenames', () => {
+    test('embedded newline is rejected as an unsafe control character', () => {
+      // A newline in a member name would corrupt a newline-delimited tar file
+      // list and enables log / line injection, so it is rejected even though
+      // it is a single segment under node_modules.
       const r = validateEntry(
         'node_modules/file\nwith newline',
         undefined,
@@ -990,7 +991,8 @@ describe('validateEntry', () => {
         allowedRoots,
         cwd
       )
-      expect(r.ok).toBe(true)
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.code).toBe('UNSAFE_CHAR')
     })
 
     test('embedded tab is accepted', () => {

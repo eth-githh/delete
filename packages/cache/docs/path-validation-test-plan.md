@@ -97,6 +97,12 @@ and platform-specific behavior:
   `C:/...`, Windows drive-relative `C:foo`, UNC `\\server\share`, UNC forward-slash,
   UNC long-path prefix `\\?\C:\...`
 - **NUL byte attacks**: NUL in path, NUL in symlink target
+- **Unsafe control characters**: embedded newline in an entry path or link
+  target → `UNSAFE_CHAR` (would corrupt a newline-delimited tar file list and
+  enables log injection). A tab is still accepted (legal, non-corrupting).
+- **Glob metacharacters** (`* ? [ ]`) in an entry path → `GLOB_METACHAR`
+  (entry paths populate the system-tar `-T` allow-list, which bsdtar matches
+  with `fnmatch()`; link targets are exempt since they are not written there)
 - **Symlink attacks**:
   - **Syntactic link-target rejects** (these fire before the containment check,
     on the same allow-list as entry-path syntax): POSIX absolute (`/etc/passwd`),
@@ -149,11 +155,17 @@ cross-checks the result against `node-tar`'s view of the entry.
 ### `crossCheckMetaBodies`
 
 - Clean PAX `path` matching `node-tar` → no violations
-- **F2 path desync** → `PAX_DESYNC` (node-tar resolved a safe name, the
+- **PAX path desync** → `PAX_DESYNC` (node-tar resolved a safe name, the
   length-correct parse disagrees)
-- **F2-linkpath desync** → `PAX_DESYNC`
+- **PAX linkpath desync** → `PAX_DESYNC`
 - Unknown PAX key → `PAX_UNKNOWN_KEY`
-- Known `SCHILY.` / `GNU.` / `LIBARCHIVE.` prefixed keys accepted
+- **`GNU.sparse.*` keys → `PAX_UNSUPPORTED_KEY`** — node-tar v7 ignores GNU
+  sparse keys, so it surfaces the entry under its header `path` while system
+  tar would reconstruct the file at `GNU.sparse.name` (an attacker-controlled,
+  potentially escaping location). A cache archive never legitimately contains
+  sparse members, so the namespace is rejected outright even though it falls
+  under the broadly-allowed `GNU.` prefix.
+- Known `SCHILY.` / `LIBARCHIVE.` prefixed keys accepted
 - GNU long-name raw body matching the entry path (or the link target) → no
   violation; a body matching neither → flagged
 - No meta bodies → no violations
@@ -164,23 +176,25 @@ cross-checks the result against `node-tar`'s view of the entry.
 
 ## Integration tests — parser-differential attacks (`tarPathValidationAttacks.test.ts`)
 
-These build the F1 / F2 / F2-linkpath / F3 / F5 proof-of-concept archives from
-the security analysis (see `docs/zip-slip-*`) as **raw tar bytes**, so they can
-craft malicious PAX bodies and typeflags that `node-tar`'s `Header` encoder
-would never emit. They assert the validator refuses each one, and they include
-real-`tar` end-to-end extraction assertions (using a scratch dir via
-`mkdtempSync`).
+These build malicious archives as **raw tar bytes**, so they can craft PAX
+bodies and typeflags that `node-tar`'s `Header` encoder would never emit. Each
+is designed to make node-tar's in-process listing disagree with the path the
+system `tar` extractor would write to. They assert the validator refuses each
+one, and they include real-`tar` end-to-end extraction assertions (using a
+scratch dir via `mkdtempSync`).
 
 ### Bypass detection (via `listAndValidate`)
 
-- **F1**: unknown typeflag → `UNSUPPORTED_TYPE`
-- **F2**: PAX `path` newline differential → `PAX_DESYNC`
-- **F2-linkpath**: PAX `linkpath` newline differential → `PAX_DESYNC`
-- **F3**: oversized PAX header → `UNSUPPORTED_TYPE`
-- **F5**: sparse typeflag → `UNSUPPORTED_TYPE`
+- Unknown typeflag → `UNSUPPORTED_TYPE`
+- PAX `path` newline differential → `PAX_DESYNC`
+- PAX `linkpath` newline differential → `PAX_DESYNC`
+- Oversized PAX header → `UNSUPPORTED_TYPE`
+- GNU sparse typeflag → `UNSUPPORTED_TYPE`
+- **PAX sparse** (`GNU.sparse.name` with a regular typeflag) → `PAX_UNSUPPORTED_KEY`,
+  and the escaping sparse name is not approved
 - Glob metacharacter in entry path → `GLOB_METACHAR`
 - Newline in entry path → `UNSAFE_CHAR`
-- NUL byte in a symlink target (delivered via PAX) → `UNSAFE_CHAR`
+- NUL byte in a symlink target (delivered via PAX) → `NUL_BYTE`
 - Unknown PAX key → `PAX_UNKNOWN_KEY`
 - Flood of extended headers → rejected by the pending-meta cap
 - Clean archive → `approvedNames` lists every concrete entry, no violations
@@ -188,9 +202,16 @@ real-`tar` end-to-end extraction assertions (using a scratch dir via
 
 ### End-to-end extraction (real `tar`)
 
+Run against whichever system `tar` is present, so CI exercises GNU tar on Linux
+and bsdtar on macOS (and `tar.exe` on Windows):
+
 - `'error'` mode, clean archive → every approved member is extracted
-- `'error'` mode, F2 archive → throws `CacheIntegrityError` and writes nothing
-  to the workspace
+- `'error'` mode, PAX path newline archive → throws `CacheIntegrityError` and
+  writes nothing to the workspace
+- `'error'` mode, leading `./` entry → still extracted (the `-T` allow-list
+  uses the canonical `cache/f` name, so the member is not silently skipped)
+- `'error'` mode, long path (> 100 bytes) delivered via PAX → extracted, not
+  dropped by the allow-list (exercises long-name matching in `-T`)
 
 ## Integration tests — real archives (`listAndValidate.test.ts`)
 

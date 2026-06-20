@@ -30,6 +30,7 @@ export interface PathValidationViolation {
     | 'PAX_DESYNC'
     | 'PAX_PARSE_FAIL'
     | 'PAX_UNKNOWN_KEY'
+    | 'PAX_UNSUPPORTED_KEY'
     | 'UNSAFE_CHAR'
     | 'GLOB_METACHAR'
   /** Human-readable description of the violation. */
@@ -400,7 +401,12 @@ export function validateEntry(
  * pre-resolution syntactic checks.
  */
 interface PathSyntaxError {
-  code: 'NUL_BYTE' | 'UNC_PATH' | 'ABSOLUTE_PATH'
+  code:
+    | 'NUL_BYTE'
+    | 'UNSAFE_CHAR'
+    | 'UNC_PATH'
+    | 'ABSOLUTE_PATH'
+    | 'GLOB_METACHAR'
   reason: string
 }
 
@@ -429,6 +435,19 @@ function checkPathSyntax(
   if (p.includes('\0')) {
     return {code: 'NUL_BYTE', reason: `NUL byte in ${kind}`}
   }
+  // Reject newline characters. They have no legitimate place in a cache entry
+  // path or link target, would corrupt a newline-delimited tar file list, and
+  // enable log / line injection in the violation output. NUL is handled above
+  // with its own, more specific code. Applied to both entry paths and link
+  // targets so the two are treated consistently.
+  if (p.includes('\n')) {
+    return {
+      code: 'UNSAFE_CHAR',
+      reason: `unsafe control character (newline) in ${kind}: ${JSON.stringify(
+        p
+      )}`
+    }
+  }
   // Reject UNC paths. Check the original string before any separator
   // normalization because UNC is identified by leading `\\` or `//`.
   if (
@@ -452,6 +471,19 @@ function checkPathSyntax(
     return {
       code: 'ABSOLUTE_PATH',
       reason: `absolute ${kind} not allowed: ${p}`
+    }
+  }
+  // Reject glob metacharacters, but only in entry paths. Approved entry paths
+  // are written to the system-tar `-T` extraction allow-list, and bsdtar
+  // matches those names with fnmatch(), so an unescaped `*`, `?`, `[` or `]`
+  // could select (and extract) members other than the one approved. GNU tar
+  // is additionally run with --no-wildcards, but rejecting here keeps the
+  // behavior identical across tar implementations. Link targets are not
+  // written to the allow-list, so they are exempt.
+  if (kind === 'entry path' && /[*?[\]]/.test(p)) {
+    return {
+      code: 'GLOB_METACHAR',
+      reason: `glob metacharacter in ${kind}: ${JSON.stringify(p)}`
     }
   }
   return undefined

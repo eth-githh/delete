@@ -16,11 +16,13 @@ import {extractTar} from '../src/internal/tar'
 import {CacheIntegrityError} from '../src/internal/cacheIntegrityError'
 
 /**
- * Parser-differential bypass regression tests. These build the F1 / F2 /
- * F2-linkpath / F3 / F5 PoC archives from the security analysis as raw tar
- * bytes (so we can craft malicious PAX bodies and typeflags that node-tar's
- * Header encoder would never produce) and assert the validator now refuses
- * each one. See docs/zip-slip-* for the analysis.
+ * Parser-differential bypass regression tests. Each case builds a malicious
+ * archive as raw tar bytes (so we can craft PAX bodies and typeflags that
+ * node-tar's Header encoder would never produce) designed to make node-tar's
+ * in-process listing disagree with the path the system `tar` extractor would
+ * write to, then asserts the validator refuses it. The vectors covered are: an
+ * unknown typeflag byte, a PAX `path=` / `linkpath=` record with an embedded
+ * newline, an oversized PAX header, and a GNU sparse typeflag.
  */
 
 // ---------------------------------------------------------------------------
@@ -115,30 +117,33 @@ function paxRecord(content: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// PoC archives
+// Malicious archives
 // ---------------------------------------------------------------------------
 
-// F1 — unknown typeflag byte ('Z') is emitted by node-tar as an ignoredEntry.
-const F1 = Buffer.concat([
+// Unknown typeflag byte ('Z') is emitted by node-tar as an ignoredEntry, but
+// system tar would extract it as a regular file.
+const unknownTypeflagArchive = Buffer.concat([
   fileEntry('cache/safe.txt', 'ok'),
-  fileEntry('../../../../../../tmp/zip_slip_F1', 'F1 pwned', 'Z'),
+  fileEntry('../../../../../../tmp/escaped_unknown_type', 'pwned', 'Z'),
   end()
 ])
 
-// F2 — PAX `path=` newline differential.
-const F2 = Buffer.concat([
+// PAX `path=` record whose value carries an embedded newline. node-tar's naive
+// `split('\n')` parse resolves the trailing `path=safe.txt`, while a
+// length-correct parse (matching system tar) resolves the escaping path.
+const paxPathNewlineArchive = Buffer.concat([
   paxEntry(
     Buffer.from(
-      '42 path=../../../../../../tmp/zip_slip_F2\n30 comment=x\n17 path=safe.txt\n',
+      '42 path=../../../../../../tmp/escaped_pax\n30 comment=x\n17 path=safe.txt\n',
       'ascii'
     )
   ),
-  fileEntry('cache/safe.txt', 'F2 pwned'),
+  fileEntry('cache/safe.txt', 'pwned'),
   end()
 ])
 
-// F2-linkpath — same differential, applied to a symlink's `linkpath=`.
-const F2L = Buffer.concat([
+// The same embedded-newline differential applied to a symlink's `linkpath=`.
+const paxLinkpathNewlineArchive = Buffer.concat([
   paxEntry(
     Buffer.from(
       '34 linkpath=../../../../../../tmp\n37 comment=x\n24 linkpath=safe/target\n',
@@ -149,23 +154,24 @@ const F2L = Buffer.concat([
   end()
 ])
 
-// F3 — oversized PAX header (> 1 MiB) is dropped by node-tar's
-// maxMetaEntrySize and would otherwise let a `path=` override slip through.
-const F3 = Buffer.concat([
+// Oversized PAX header (> 1 MiB) is dropped by node-tar's maxMetaEntrySize and
+// would otherwise let the `path=` override slip through unseen.
+const oversizedPaxHeaderArchive = Buffer.concat([
   paxEntry(
     Buffer.concat([
       Buffer.from(`1048600 comment=${'A'.repeat(1048600 - 17)}\n`, 'ascii'),
-      Buffer.from('42 path=../../../../../../tmp/zip_slip_F3\n', 'ascii')
+      Buffer.from('42 path=../../../../../../tmp/escaped_big\n', 'ascii')
     ])
   ),
-  fileEntry('cache/safe.txt', 'F3 pwned'),
+  fileEntry('cache/safe.txt', 'pwned'),
   end()
 ])
 
-// F5 — sparse typeflag 'S' is mapped but ignored by node-tar's ReadEntry.
-const F5 = Buffer.concat([
+// GNU sparse typeflag 'S' is mapped but ignored by node-tar's ReadEntry, while
+// system tar would extract it.
+const sparseTypeflagArchive = Buffer.concat([
   fileEntry('cache/decoy.txt', 'ok'),
-  fileEntry('../../../../../../tmp/zip_slip_F5', '', 'S'),
+  fileEntry('../../../../../../tmp/escaped_sparse', '', 'S'),
   end()
 ])
 
@@ -228,33 +234,50 @@ afterAll(() => {
 })
 
 describe('listAndValidate: parser-differential bypass detection', () => {
-  test('F1: unknown typeflag is rejected as UNSUPPORTED_TYPE', async () => {
-    const {violations, approvedNames} = await validate(F1, 'f1.tar.gz')
+  test('unknown typeflag is rejected as UNSUPPORTED_TYPE', async () => {
+    const {violations, approvedNames} = await validate(
+      unknownTypeflagArchive,
+      'unknown-typeflag.tar.gz'
+    )
     expect(violations).toContain('UNSUPPORTED_TYPE')
     // The escaping entry must NOT be approved for extraction.
-    expect(approvedNames).not.toContain('../../../../../../tmp/zip_slip_F1')
+    expect(approvedNames).not.toContain(
+      '../../../../../../tmp/escaped_unknown_type'
+    )
   })
 
-  test('F2: PAX path newline differential is rejected as PAX_DESYNC', async () => {
-    const {violations, approvedNames} = await validate(F2, 'f2.tar.gz')
+  test('PAX path newline differential is rejected as PAX_DESYNC', async () => {
+    const {violations, approvedNames} = await validate(
+      paxPathNewlineArchive,
+      'pax-path-newline.tar.gz'
+    )
     expect(violations).toContain('PAX_DESYNC')
     expect(approvedNames).toEqual([])
   })
 
-  test('F2-linkpath: PAX linkpath newline differential is rejected as PAX_DESYNC', async () => {
-    const {violations} = await validate(F2L, 'f2l.tar.gz')
+  test('PAX linkpath newline differential is rejected as PAX_DESYNC', async () => {
+    const {violations} = await validate(
+      paxLinkpathNewlineArchive,
+      'pax-linkpath-newline.tar.gz'
+    )
     expect(violations).toContain('PAX_DESYNC')
   })
 
-  test('F3: oversized PAX header is rejected as UNSUPPORTED_TYPE', async () => {
-    const {violations} = await validate(F3, 'f3.tar.gz')
+  test('oversized PAX header is rejected as UNSUPPORTED_TYPE', async () => {
+    const {violations} = await validate(
+      oversizedPaxHeaderArchive,
+      'oversized-pax.tar.gz'
+    )
     expect(violations).toContain('UNSUPPORTED_TYPE')
   })
 
-  test('F5: sparse typeflag is rejected as UNSUPPORTED_TYPE', async () => {
-    const {violations, approvedNames} = await validate(F5, 'f5.tar.gz')
+  test('sparse typeflag is rejected as UNSUPPORTED_TYPE', async () => {
+    const {violations, approvedNames} = await validate(
+      sparseTypeflagArchive,
+      'sparse-typeflag.tar.gz'
+    )
     expect(violations).toContain('UNSUPPORTED_TYPE')
-    expect(approvedNames).not.toContain('../../../../../../tmp/zip_slip_F5')
+    expect(approvedNames).not.toContain('../../../../../../tmp/escaped_sparse')
   })
 
   test('glob metacharacter in entry path is rejected as GLOB_METACHAR', async () => {
@@ -287,14 +310,14 @@ describe('listAndValidate: parser-differential bypass detection', () => {
     expect(violations).toContain('UNSAFE_CHAR')
   })
 
-  test('NUL byte in a symlink target (via PAX) is rejected as UNSAFE_CHAR', async () => {
+  test('NUL byte in a symlink target (via PAX) is rejected as NUL_BYTE', async () => {
     const archive = Buffer.concat([
       paxEntry(Buffer.from(paxRecord('linkpath=cache/sub/t\0'), 'ascii')),
       header({name: 'cache/link', typeflag: '2', linkname: 'cache/sub/t'}),
       end()
     ])
     const {violations} = await validate(archive, 'nul-link.tar.gz')
-    expect(violations).toContain('UNSAFE_CHAR')
+    expect(violations).toContain('NUL_BYTE')
   })
 
   test('legitimate long path via PAX: no violations, approved by its PAX path', async () => {
@@ -321,6 +344,28 @@ describe('listAndValidate: parser-differential bypass detection', () => {
     ])
     const {violations} = await validate(archive, 'unknown-key.tar.gz')
     expect(violations).toContain('PAX_UNKNOWN_KEY')
+  })
+
+  test('PAX sparse (GNU.sparse.name) is rejected as PAX_UNSUPPORTED_KEY', async () => {
+    // node-tar v7 ignores GNU sparse keys, so without this rejection the entry
+    // would be approved under its benign header path while system tar would
+    // reconstruct the file at GNU.sparse.name (here outside the cache roots).
+    const sparseName = '../../../../../../tmp/escaped_sparse_pax'
+    const body = Buffer.from(
+      paxRecord('GNU.sparse.major=1') +
+        paxRecord('GNU.sparse.minor=0') +
+        paxRecord(`GNU.sparse.name=${sparseName}`) +
+        paxRecord('GNU.sparse.realsize=4'),
+      'ascii'
+    )
+    const archive = Buffer.concat([
+      paxEntry(body),
+      fileEntry('cache/GNUSparseFile.0/decoy', 'data'),
+      end()
+    ])
+    const {violations, approvedNames} = await validate(archive, 'sparse.tar.gz')
+    expect(violations).toContain('PAX_UNSUPPORTED_KEY')
+    expect(approvedNames).not.toContain(sparseName)
   })
 
   test('flood of extended headers is rejected (pending-meta cap)', async () => {
@@ -382,12 +427,12 @@ describeTar('extractTar end-to-end with system tar allow-list', () => {
     expect(existsSync(path.join(dest, 'cache', 'sub', 'deep.txt'))).toBe(true)
   })
 
-  test('error mode, F2 archive: throws and writes nothing to the workspace', async () => {
-    const dest = mkdtempSync(path.join(ROOT, 'extract-f2-'))
+  test('error mode, PAX path newline archive: throws and writes nothing to the workspace', async () => {
+    const dest = mkdtempSync(path.join(ROOT, 'extract-pax-path-newline-'))
     process.env['GITHUB_WORKSPACE'] = dest
-    const archivePath = path.join(dest, 'f2.tar.gz')
+    const archivePath = path.join(dest, 'pax-path-newline.tar.gz')
     mkdirSync(dest, {recursive: true})
-    writeFileSync(archivePath, gzipSync(F2))
+    writeFileSync(archivePath, gzipSync(paxPathNewlineArchive))
 
     await expect(
       extractTar(archivePath, CompressionMethod.Gzip, {
@@ -399,5 +444,56 @@ describeTar('extractTar end-to-end with system tar allow-list', () => {
     // No member was extracted anywhere under the workspace.
     expect(existsSync(path.join(dest, 'cache'))).toBe(false)
     expect(existsSync(path.join(dest, 'safe.txt'))).toBe(false)
+  })
+
+  test('error mode: a leading ./ entry still extracts (allow-list name matches)', async () => {
+    // node-tar surfaces the entry as `./cache/dotslash.txt`; the `-T` allow
+    // list must use the canonical `cache/dotslash.txt` so the member is not
+    // silently skipped. Verifies the canonicalMemberName normalization under
+    // whichever system tar is present (GNU on Linux CI, BSD on macOS).
+    const dest = mkdtempSync(path.join(ROOT, 'extract-dotslash-'))
+    process.env['GITHUB_WORKSPACE'] = dest
+    const archive = Buffer.concat([
+      dirEntry('cache/'),
+      fileEntry('./cache/dotslash.txt', 'dot'),
+      end()
+    ])
+    const archivePath = path.join(dest, 'dotslash.tar.gz')
+    mkdirSync(dest, {recursive: true})
+    writeFileSync(archivePath, gzipSync(archive))
+
+    await extractTar(archivePath, CompressionMethod.Gzip, {
+      declaredPaths: ['cache/**'],
+      pathValidation: 'error'
+    })
+
+    expect(existsSync(path.join(dest, 'cache', 'dotslash.txt'))).toBe(true)
+    expect(readFileSync(path.join(dest, 'cache', 'dotslash.txt'), 'utf8')).toBe(
+      'dot'
+    )
+  })
+
+  test('error mode: a long path via PAX is extracted, not dropped by the allow-list', async () => {
+    // > 100 bytes, so the name travels via a PAX `path=` record (and a GNU
+    // long-name on creation). Exercises long-name matching in the `-T` list so
+    // a legitimate long path is not silently skipped during extraction.
+    const dest = mkdtempSync(path.join(ROOT, 'extract-long-'))
+    process.env['GITHUB_WORKSPACE'] = dest
+    const longRel = `cache/${'x'.repeat(110)}.txt`
+    const archive = Buffer.concat([
+      paxEntry(Buffer.from(paxRecord(`path=${longRel}`), 'ascii')),
+      fileEntry('cache/placeholder', 'L'),
+      end()
+    ])
+    const archivePath = path.join(dest, 'long.tar.gz')
+    mkdirSync(dest, {recursive: true})
+    writeFileSync(archivePath, gzipSync(archive))
+
+    await extractTar(archivePath, CompressionMethod.Gzip, {
+      declaredPaths: ['cache/**'],
+      pathValidation: 'error'
+    })
+
+    expect(existsSync(path.join(dest, longRel))).toBe(true)
   })
 })

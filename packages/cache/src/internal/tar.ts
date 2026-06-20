@@ -20,7 +20,8 @@ import {
   PathValidationMode,
   PathValidationViolation,
   deriveAllowedRoots,
-  formatViolationSummary
+  formatViolationSummary,
+  getWorkingDirectory
 } from './pathValidation.js'
 
 const IS_WINDOWS = process.platform === 'win32'
@@ -201,10 +202,6 @@ async function getCommands(
   }
 
   return [args.join(' ')]
-}
-
-function getWorkingDirectory(): string {
-  return process.env['GITHUB_WORKSPACE'] ?? process.cwd()
 }
 
 // Common function for extractTar and listTar to get the compression method
@@ -431,14 +428,35 @@ function writeAllowList(approvedNames: string[]): string {
   const allowListPath = path.join(
     os.tmpdir(),
     `cache-allow-${process.pid}-${Date.now()}-${crypto
-      .randomBytes(4)
+      .randomBytes(8)
       .toString('hex')}.lst`
   )
   const payload = Buffer.concat(
-    approvedNames.flatMap(name => [Buffer.from(name, 'utf8'), Buffer.from([0])])
+    approvedNames.flatMap(name => [
+      Buffer.from(canonicalMemberName(name), 'utf8'),
+      Buffer.from([0])
+    ])
   )
-  writeFileSync(allowListPath, payload, {mode: 0o600})
+  // `flag: 'wx'` (O_CREAT | O_EXCL | O_WRONLY) makes the open fail if the path
+  // already exists, so a file or symlink pre-planted at the (randomized) temp
+  // path on a shared/self-hosted runner cannot redirect or capture the write.
+  // mode 0o600 keeps the list readable only by the current user. Both options
+  // behave consistently on Windows, macOS and Linux.
+  writeFileSync(allowListPath, payload, {mode: 0o600, flag: 'wx'})
   return allowListPath
+}
+
+/**
+ * Canonicalize an approved entry name to the form system `tar` matches against
+ * its archive members when reading the `-T` allow-list. node-tar already
+ * converts backslashes to forward slashes; here we additionally strip any
+ * leading `./` (both GNU tar and bsdtar normalize member names this way) so an
+ * entry node-tar surfaced as `./cache/f` still matches the member `cache/f`
+ * and is not silently skipped during extraction. A trailing slash on a
+ * directory entry is preserved because tar matches directories with it.
+ */
+function canonicalMemberName(name: string): string {
+  return name.replace(/^(?:\.\/)+/, '')
 }
 
 function reportViolations(
