@@ -208,8 +208,10 @@ and bsdtar on macOS (and `tar.exe` on Windows):
 - `'error'` mode, clean archive → every approved member is extracted
 - `'error'` mode, PAX path newline archive → throws `CacheIntegrityError` and
   writes nothing to the workspace
-- `'error'` mode, leading `./` entry → still extracted (the `-T` allow-list
-  uses the canonical `cache/f` name, so the member is not silently skipped)
+- `'error'` mode, leading `./` entry → still extracted; the `-T` allow-list
+  uses the member name verbatim (exactly as node-tar derived it from the
+  archive), which is what GNU tar matches anchored/exact — stripping the `./`
+  would make GNU tar report "Not found in archive"
 - `'error'` mode, long path (> 100 bytes) delivered via PAX → extracted, not
   dropped by the allow-list (exercises long-name matching in `-T`)
 

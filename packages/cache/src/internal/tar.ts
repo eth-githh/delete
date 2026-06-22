@@ -431,11 +431,16 @@ function writeAllowList(approvedNames: string[]): string {
       .randomBytes(8)
       .toString('hex')}.lst`
   )
+  // Write each approved name exactly as node-tar derived it from the archive
+  // bytes. That is the same name system tar reads from the archive header, so
+  // an anchored `-T` match succeeds for every member without us second-guessing
+  // tar's name handling. In particular we must NOT strip a leading `./`: GNU
+  // tar matches `-T` names anchored and exact and keeps the `./`, so a
+  // `cache/f` pattern does not match a `./cache/f` member (it fails with
+  // "Not found in archive", exit code 2) whereas the verbatim `./cache/f`
+  // matches and extracts to `cache/f`.
   const payload = Buffer.concat(
-    approvedNames.flatMap(name => [
-      Buffer.from(canonicalMemberName(name), 'utf8'),
-      Buffer.from([0])
-    ])
+    approvedNames.flatMap(name => [Buffer.from(name, 'utf8'), Buffer.from([0])])
   )
   // `flag: 'wx'` (O_CREAT | O_EXCL | O_WRONLY) makes the open fail if the path
   // already exists, so a file or symlink pre-planted at the (randomized) temp
@@ -444,19 +449,6 @@ function writeAllowList(approvedNames: string[]): string {
   // behave consistently on Windows, macOS and Linux.
   writeFileSync(allowListPath, payload, {mode: 0o600, flag: 'wx'})
   return allowListPath
-}
-
-/**
- * Canonicalize an approved entry name to the form system `tar` matches against
- * its archive members when reading the `-T` allow-list. node-tar already
- * converts backslashes to forward slashes; here we additionally strip any
- * leading `./` (both GNU tar and bsdtar normalize member names this way) so an
- * entry node-tar surfaced as `./cache/f` still matches the member `cache/f`
- * and is not silently skipped during extraction. A trailing slash on a
- * directory entry is preserved because tar matches directories with it.
- */
-function canonicalMemberName(name: string): string {
-  return name.replace(/^(?:\.\/)+/, '')
 }
 
 function reportViolations(
