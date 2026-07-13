@@ -3,7 +3,13 @@ import * as path from 'path'
 import * as utils from './internal/cacheUtils'
 import * as cacheHttpClient from './internal/cacheHttpClient'
 import * as cacheTwirpClient from './internal/shared/cacheTwirpClient'
-import {getCacheServiceVersion, isGhes} from './internal/config'
+import {
+  getCacheServiceVersion,
+  isGhes,
+  getCacheMode,
+  isCacheReadable,
+  isCacheWritable
+} from './internal/config'
 import {DownloadOptions, UploadOptions} from './options'
 import {createTar, extractTar, listTar} from './internal/tar'
 import {
@@ -13,6 +19,7 @@ import {
   GetCacheEntryDownloadURLRequest
 } from './generated/results/api/v1/cache'
 import {HttpClientError} from '@actions/http-client'
+import {CacheReadDeniedMessagePrefix} from './internal/constants'
 export class ValidationError extends Error {
   constructor(message: string) {
     super(message)
@@ -47,6 +54,21 @@ export class CacheWriteDeniedError extends ReserveCacheError {
     super(message)
     this.name = 'CacheWriteDeniedError'
     Object.setPrototypeOf(this, CacheWriteDeniedError.prototype)
+  }
+}
+
+// Re-exported from constants so consumers keep referencing it here; the shared
+// value also drives detection in cacheHttpClient without duplicating the string.
+export const CACHE_READ_DENIED_PREFIX = CacheReadDeniedMessagePrefix
+
+// Raised when the cache backend denies a download URL because the run's token
+// has no readable cache scopes. Caching is best-effort, so restoreCache logs a
+// warning and reports a cache miss rather than rethrowing this.
+export class CacheReadDeniedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CacheReadDeniedError'
+    Object.setPrototypeOf(this, CacheReadDeniedError.prototype)
   }
 }
 
@@ -122,6 +144,17 @@ export async function restoreCache(
 
   checkPaths(paths)
 
+  const cacheMode = getCacheMode()
+  if (!isCacheReadable(cacheMode)) {
+    core.info(
+      `Cache restore skipped: the effective cache-mode '${cacheMode}' does not permit reads.`
+    )
+    core.debug(
+      `Skipped restore for paths [${paths.join(', ')}] with primary key '${primaryKey}'.`
+    )
+    return undefined
+  }
+
   switch (cacheServiceVersion) {
     case 'v2':
       return await restoreCacheV2(
@@ -179,10 +212,25 @@ async function restoreCacheV1(
   let archivePath = ''
   try {
     // path are needed to compute version
-    const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
-      compressionMethod,
-      enableCrossOsArchive
-    })
+    let cacheEntry
+    try {
+      cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
+        compressionMethod,
+        enableCrossOsArchive
+      })
+    } catch (error) {
+      // The v1 artifact cache service returns HTTP 403 with a
+      // `cache read denied:` body when the run's token has no readable cache
+      // scopes. getCacheEntry lives in a dependency-free internal module and
+      // cannot import CacheReadDeniedError without a circular dependency, so it
+      // only surfaces the raw denial message; we classify it into the typed
+      // error here so the outer catch and consumers can dispatch on it.
+      const errorMessage = (error as Error)?.message ?? ''
+      if (errorMessage.includes(CACHE_READ_DENIED_PREFIX)) {
+        throw new CacheReadDeniedError(errorMessage)
+      }
+      throw error
+    }
     if (!cacheEntry?.archiveLocation) {
       // Cache not found
       return undefined
@@ -227,7 +275,9 @@ async function restoreCacheV1(
       throw error
     } else {
       // warn on cache restore failure and continue build
-      // Log server errors (5xx) as errors, all other errors as warnings
+      // Log server errors (5xx) as errors, all other errors as warnings.
+      // A read denied by policy (CacheReadDeniedError) is not an HttpClientError
+      // so it falls here and is warned, treated as a cache miss.
       if (
         typedError instanceof HttpClientError &&
         typeof typedError.statusCode === 'number' &&
@@ -302,7 +352,19 @@ async function restoreCacheV2(
       )
     }
 
-    const response = await twirpClient.GetCacheEntryDownloadURL(request)
+    let response
+    try {
+      response = await twirpClient.GetCacheEntryDownloadURL(request)
+    } catch (error) {
+      // The receiver returns twirp PermissionDenied (403) when the run's token
+      // has no readable cache scopes. The client wraps that 403, so the stable
+      // prefix is embedded in the message rather than leading it.
+      const errorMessage = (error as Error)?.message ?? ''
+      if (errorMessage.includes(CACHE_READ_DENIED_PREFIX)) {
+        throw new CacheReadDeniedError(errorMessage)
+      }
+      throw error
+    }
 
     if (!response.ok) {
       core.debug(
@@ -359,7 +421,9 @@ async function restoreCacheV2(
       throw error
     } else {
       // Supress all non-validation cache related errors because caching should be optional
-      // Log server errors (5xx) as errors, all other errors as warnings
+      // Log server errors (5xx) as errors, all other errors as warnings.
+      // A read denied by policy (CacheReadDeniedError) is not an HttpClientError
+      // so it falls here and is warned, treated as a cache miss.
       if (
         typedError instanceof HttpClientError &&
         typeof typedError.statusCode === 'number' &&
@@ -402,6 +466,18 @@ export async function saveCache(
   core.debug(`Cache service version: ${cacheServiceVersion}`)
   checkPaths(paths)
   checkKey(key)
+
+  const cacheMode = getCacheMode()
+  if (!isCacheWritable(cacheMode)) {
+    core.info(
+      `Cache save skipped: the effective cache-mode '${cacheMode}' does not permit writes.`
+    )
+    core.debug(
+      `Skipped save for paths [${paths.join(', ')}] with key '${key}'.`
+    )
+    return -1
+  }
+
   switch (cacheServiceVersion) {
     case 'v2':
       return await saveCacheV2(paths, key, options, enableCrossOsArchive)
