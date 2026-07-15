@@ -35,6 +35,7 @@ import {
   retryTypedResponse
 } from './requestUtils'
 import {getCacheServiceURL} from './config'
+import {CacheReadDeniedMessagePrefix} from './constants'
 import {getUserAgentString} from './shared/user-agent'
 
 function getCacheApiUrl(resource: string): string {
@@ -101,6 +102,12 @@ export async function getCacheEntry(
     return null
   }
   if (!isSuccessStatusCode(response.statusCode)) {
+    // Only surface the receiver's body for a `cache read denied:` policy denial
+    // so callers can dispatch on it; keep the generic message otherwise.
+    const errorMessage = response.error?.message
+    if (errorMessage?.includes(CacheReadDeniedMessagePrefix)) {
+      throw new Error(errorMessage)
+    }
     throw new Error(`Cache service responded with ${response.statusCode}`)
   }
 
